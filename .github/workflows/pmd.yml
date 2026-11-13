@@ -42,3 +42,6 @@ jobs:
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: pmd-report.sarif
+      - name: Fail on excessive complexity
+        if: steps.pmd.outputs.violations != '0'
+        run: exit 1
