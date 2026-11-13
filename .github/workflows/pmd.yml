@@ -1,193 +1,300 @@
-# This workflow uses actions that are not certified by GitHub.
-# They are provided by a third-party and are governed by
-# separate terms of service, privacy policy, and support
-# documentation.
-
-name: pmd
+name: PMD Method Complexity
 
 on:
-  push:
-    branches: [ "main" ]
   pull_request:
-    branches: [ "main" ]
-  schedule:
-    - cron: '30 3 * * 5'
+    branches: ["main"]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read
-  security-events: write
-  actions: read
   pull-requests: write
+
+concurrency:
+  group: pmd-methods-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   pmd-code-scan:
-    permissions:
-      contents: read # for actions/checkout to fetch code
-      security-events: write # for github/codeql-action/upload-sarif to upload SARIF results
-      actions: read # only required for a private repository by github/codeql-action/upload-sarif to get the Action run status
-      pull-requests: write
     runs-on: ubuntu-latest
+
+    env:
+      PMD_VERSION: "6.55.0"
+      SOURCE_PATH: "Invaders-SDP-23621-main/src"
+      COMPLEXITY_LIMIT: "10"
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin
+
+      - name: Download PMD
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl --fail --location --retry 3 \
+            "https://github.com/pmd/pmd/releases/download/pmd_releases%2F${PMD_VERSION}/pmd-bin-${PMD_VERSION}.zip" \
+            --output "${RUNNER_TEMP}/pmd.zip"
+
+          unzip -q "${RUNNER_TEMP}/pmd.zip" \
+            -d "${RUNNER_TEMP}/pmd-tool"
+
       - name: Run PMD
-        id: pmd
-        uses: pmd/pmd-github-action@v2
-        with:
-          version: '6.55.0'
-          rulesets: '.github/workflows/pmd-ruleset.xml'
-          sourcePath: 'Invaders-SDP-23621-main/src'
-          analyzeModifiedFilesOnly: false
-      - name: Upload SARIF file
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: pmd-report.sarif
-      - name: Comment changed method complexity
-        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -d "${SOURCE_PATH}"
+          test -f ".github/workflows/pmd-ruleset.xml"
+
+          "${RUNNER_TEMP}/pmd-tool/pmd-bin-${PMD_VERSION}/bin/run.sh" pmd \
+            -d "${SOURCE_PATH}" \
+            -R ".github/workflows/pmd-ruleset.xml" \
+            -f xml \
+            -r "${RUNNER_TEMP}/pmd-report.xml" \
+            -language java \
+            -version 17 \
+            -no-cache \
+            -failOnViolation false
+
+      - name: Select methods changed in this PR
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          workspace = Path.cwd().resolve()
+          temp = Path(os.environ["RUNNER_TEMP"])
+          limit = int(os.environ["COMPLEXITY_LIMIT"])
+
+          def git(*args):
+              return subprocess.check_output(
+                  ["git", *args],
+                  encoding="utf-8",
+              )
+
+          base = git(
+              "merge-base",
+              os.environ["BASE_SHA"],
+              "HEAD",
+          ).strip()
+
+          files = git(
+              "diff",
+              "--name-only",
+              "-z",
+              "--diff-filter=AMR",
+              base,
+              "HEAD",
+              "--",
+              "*.java",
+          ).split("\0")
+
+          changed = {}
+
+          for filename in filter(None, files):
+              diff = git(
+                  "diff",
+                  "--no-ext-diff",
+                  "--no-color",
+                  "--unified=0",
+                  base,
+                  "HEAD",
+                  "--",
+                  filename,
+              )
+
+              ranges = []
+              for match in re.finditer(
+                  r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@",
+                  diff,
+                  re.MULTILINE,
+              ):
+                  start = int(match.group(1))
+                  count = (
+                      int(match.group(2))
+                      if match.group(2) is not None
+                      else 1
+                  )
+
+                  if count:
+                      ranges.append((start, start + count - 1))
+                  else:
+                      # Deletion-only change: retain its new-file anchor.
+                      anchor = max(1, start)
+                      ranges.append((anchor, anchor))
+
+              changed[filename] = ranges
+
+          root = ET.parse(temp / "pmd-report.xml").getroot()
+
+          def local_name(element):
+              return element.tag.rsplit("}", 1)[-1]
+
+          # Do not publish a misleading clean result if analysis failed.
+          errors = [
+              element
+              for element in root.iter()
+              if local_name(element) in {
+                  "error", "configerror", "configurationError"
+              }
+          ]
+          if errors:
+              details = [
+                  element.attrib.get("msg")
+                  or element.attrib.get("message")
+                  or "".join(element.itertext()).strip()
+                  for element in errors
+              ]
+              raise RuntimeError(
+                  "PMD analysis errors:\n" + "\n".join(details)
+              )
+
+          rows = []
+          seen = set()
+
+          for file_element in root:
+              if local_name(file_element) != "file":
+                  continue
+
+              file_path = Path(file_element.attrib["name"])
+              if not file_path.is_absolute():
+                  file_path = workspace / file_path
+
+              try:
+                  filename = (
+                      file_path.resolve()
+                      .relative_to(workspace)
+                      .as_posix()
+                  )
+              except ValueError:
+                  continue
+
+              ranges = changed.get(filename)
+              if not ranges:
+                  continue
+
+              for violation in file_element:
+                  if local_name(violation) != "violation":
+                      continue
+                  if violation.attrib.get("rule") != "CyclomaticComplexity":
+                      continue
+
+                  message = "".join(violation.itertext()).strip()
+                  match = re.search(
+                      r"The method '(.+)' has a cyclomatic complexity of (\d+)",
+                      message,
+                  )
+                  if not match:
+                      continue
+
+                  start = int(violation.attrib["beginline"])
+                  end = int(violation.attrib["endline"])
+
+                  if not any(
+                      change_start <= end and change_end >= start
+                      for change_start, change_end in ranges
+                  ):
+                      continue
+
+                  name = match.group(1)
+                  complexity = int(match.group(2))
+                  key = (filename, start, name)
+
+                  if key in seen:
+                      continue
+                  seen.add(key)
+
+                  rows.append({
+                      "file": filename,
+                      "line": start,
+                      "name": name,
+                      "complexity": complexity,
+                      "exceeded": complexity > limit,
+                  })
+
+          rows.sort(key=lambda row: (row["file"], row["line"]))
+
+          (temp / "pmd-methods.json").write_text(
+              json.dumps(rows, ensure_ascii=False),
+              encoding="utf-8",
+          )
+
+          print(f"Changed methods found: {len(rows)}")
+          PY
+
+      - name: Create or update PR comment
         uses: actions/github-script@v7
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         with:
           script: |
             const fs = require('fs');
             const path = require('path');
-            const { execFileSync } = require('child_process');
-            const { fileURLToPath } = require('url');
 
-            const limit = 10;
-            const marker = '<!-- pmd-complexity-report -->';
-            const git = (...args) =>
-              execFileSync('git', args, { encoding: 'utf8' });
-
-            const base = git(
-              'merge-base', process.env.BASE_SHA, 'HEAD'
-            ).trim();
-
-            const files = git(
-              'diff', '--name-only', '-z', '--diff-filter=AMR',
-              base, 'HEAD', '--', '*.java'
-            ).split('\0').filter(Boolean);
-
-            // PR에서 변경된 줄 범위를 파일별로 수집합니다.
-            const changed = new Map();
-            for (const file of files) {
-              const diff = git(
-                'diff', '--no-ext-diff', '--no-color',
-                '--unified=0', base, 'HEAD', '--', file
-              );
-              const ranges = [];
-
-              for (const match of diff.matchAll(
-                /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gm
-              )) {
-                const start = Number(match[1]);
-                const count = match[2] === undefined
-                  ? 1 : Number(match[2]);
-
-                // 삭제만 있는 변경도 해당 위치를 검사합니다.
-                ranges.push([
-                  Math.max(1, start),
-                  count === 0
-                    ? Math.max(1, start)
-                    : start + count - 1
-                ]);
-              }
-
-              changed.set(file, ranges);
-            }
-
-            function relativeFile(uri) {
-              let file = uri.startsWith('file:')
-                ? fileURLToPath(uri)
-                : decodeURIComponent(uri);
-
-              if (path.isAbsolute(file)) {
-                file = path.relative(process.cwd(), file);
-              }
-              return file.replace(/\\/g, '/').replace(/^\.\//, '');
-            }
-
-            const report = JSON.parse(
-              fs.readFileSync('pmd-report.sarif', 'utf8')
+            const rows = JSON.parse(
+              fs.readFileSync(
+                path.join(process.env.RUNNER_TEMP, 'pmd-methods.json'),
+                'utf8'
+              )
             );
-            const rows = [];
-            const seen = new Set();
 
-            for (const run of report.runs ?? []) {
-              for (const result of run.results ?? []) {
-                const message = result.message?.text ?? '';
-                const match = message.match(
-                  /The method '(.+)' has a cyclomatic complexity of (\d+)/
-                );
-                if (!match) continue;
+            const marker = '<!-- pmd-complexity-report -->';
 
-                const location =
-                  result.locations?.[0]?.physicalLocation;
-                const artifact = location?.artifactLocation;
-                const uri = artifact?.uri ??
-                  run.artifacts?.[artifact?.index]?.location?.uri;
-                if (!uri) continue;
-
-                const file = relativeFile(uri);
-                const ranges = changed.get(file);
-                if (!ranges) continue;
-
-                const region = location.region;
-                if (!region?.startLine || !region?.endLine) {
-                  throw new Error(
-                    `메서드 범위 정보가 없습니다: ${file}. ` +
-                    '정확한 변경 메서드 필터링을 위해 보고서 확인이 필요합니다.'
-                  );
-                }
-
-                const touched = ranges.some(([start, end]) =>
-                  start <= region.endLine &&
-                  end >= region.startLine
-                );
-                if (!touched) continue;
-
-                const key = `${file}:${region.startLine}:${match[1]}`;
-                if (seen.has(key)) continue;
-                seen.add(key);
-
-                const name = match[1].replace(/\|/g, '&#124;');
-                const complexity = Number(match[2]);
-                rows.push(
-                  `| ${name} | ${complexity} | ` +
-                  `${complexity > limit ? '⚠️ 초과' : '정상'} |`
-                );
-              }
+            function escapeCell(value) {
+              return String(value)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/\|/g, '&#124;')
+                .replace(/[\r\n]+/g, ' ');
             }
 
-            const header = [
+            let body = [
               marker,
-              `허용 복잡도: ${limit} 이하`,
-              '',
-              '| 메서드 이름 | 복잡도 | 기준 초과 |',
+              '| 메서드 이름 | 복잡도 | 초과 여부 |',
               '|---|---:|---|'
             ].join('\n');
 
-            let body = rows.length
-              ? header
-              : `${marker}\n이번 PR에서 변경된 분석 대상 메서드가 없습니다.`;
+            if (rows.length === 0) {
+              body += '\n| 변경된 분석 대상 메서드 없음 | — | — |';
+            }
 
             for (const row of rows) {
-              if (body.length + row.length > 55000) {
-                body += '\n\n댓글 길이 제한으로 나머지 항목은 생략했습니다.';
+              const line =
+                `\n| ${escapeCell(row.name)} | ${row.complexity} | ` +
+                `${row.exceeded ? '⚠️ 초과' : '정상'} |`;
+
+              if (body.length + line.length > 55000) {
+                body += '\n\n댓글 길이 제한으로 일부 항목이 생략됐습니다.';
                 break;
               }
-              body += '\n' + row;
+
+              body += line;
             }
 
             const params = {
               ...context.repo,
               issue_number: context.issue.number
             };
+
             const comments = await github.paginate(
-              github.rest.issues.listComments, params
+              github.rest.issues.listComments,
+              params
             );
+
             const previous = comments.find(comment =>
               comment.user.type === 'Bot' &&
               comment.body?.includes(marker)
@@ -205,3 +312,13 @@ jobs:
                 body
               });
             }
+
+      - name: Save PMD reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pmd-method-complexity
+          path: |
+            ${{ runner.temp }}/pmd-report.xml
+            ${{ runner.temp }}/pmd-methods.json
+          if-no-files-found: ignore
