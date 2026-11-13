@@ -6,7 +6,7 @@
         Report cyclomatic complexity for each method.
     </description>
 
-    <rule ref=".github/workflows/complexity.yml">
+    <rule ref="category/java/design.xml/CyclomaticComplexity">
         <properties>
             <property name="methodReportLevel" value="1"/>
         </properties>
