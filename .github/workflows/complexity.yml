@@ -81,18 +81,10 @@ jobs:
           )
 
           # Report all executable methods; ignore class-level findings below.
-          rules = temp / "complexity-rules.xml"
-          rules.write_text("""<?xml version="1.0" encoding="UTF-8"?>
-          <ruleset name="Method complexity"
-                   xmlns="http://pmd.sourceforge.net/ruleset/2.0.0">
-            <description>Measure method cyclomatic complexity.</description>
-            <rule ref="category/java/design.xml/CyclomaticComplexity">
-              <properties>
-                <property name="methodReportLevel" value="1"/>
-              </properties>
-            </rule>
-          </ruleset>
-          """, encoding="utf-8")
+          rules = Path(".github/workflows/pmd-ruleset.xml")
+
+          if not rules.is_file():
+            raise SystemExit(f"PMD ruleset not found: {rules}")
 
           rows = []
           failed = False
