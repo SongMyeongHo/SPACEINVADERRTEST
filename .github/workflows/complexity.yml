@@ -7,6 +7,7 @@ on:
 permissions:
   contents: read
   issues: write
+  pull-requests: write
 
 concurrency:
   group: method-complexity-${{ github.event.pull_request.number }}
@@ -207,6 +208,16 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
+            github.hook.error("request", async (error) => {
+              core.error(JSON.stringify({
+                status: error.status,
+                message: error.message,
+                method: error.request?.method,
+                url: error.request?.url,
+                requiredPermissions: error.response?.headers?.["x-accepted-github-permissions"]
+              }));
+              throw error;
+            });
             const fs = require("fs");
             const path = require("path");
             const reportPath = path.join(process.env.RUNNER_TEMP, "complexity-result.json");
