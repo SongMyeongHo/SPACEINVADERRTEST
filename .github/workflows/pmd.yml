@@ -35,7 +35,7 @@ jobs:
         uses: pmd/pmd-github-action@v2
         with:
           version: '6.55.0'
-          rulesets: 'pmd-ruleset.xml'
+          rulesets: '.github/workflows/pmd-ruleset.xml'
           sourcePath: 'Invaders-SDP-23621-main/src'
           analyzeModifiedFilesOnly: false
       - name: Upload SARIF file
