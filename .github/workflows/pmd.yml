@@ -42,6 +42,6 @@ jobs:
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: pmd-report.sarif
-      - name: Warn on excessive complexity
+      - name: Fail on excessive complexity
         if: steps.pmd.outputs.violations != '0'
-        run: echo "::warning title=PMD Complexity::Complexity threshold exceeded. Check the PMD report."
+        run: exit 1
