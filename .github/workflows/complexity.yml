@@ -1,0 +1,272 @@
+name: Method Complexity
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: method-complexity-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  complexity:
+    runs-on: ubuntu-latest
+
+    env:
+      PMD_VERSION: "6.55.0"
+      SOURCE_PATH: Invaders-SDP-23621-main/src
+      COMPLEXITY_LIMIT: "10"
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install PMD
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 \
+            "https://github.com/pmd/pmd/releases/download/pmd_releases%2F${PMD_VERSION}/pmd-bin-${PMD_VERSION}.zip" \
+            --output "${RUNNER_TEMP}/pmd.zip"
+          unzip -q "${RUNNER_TEMP}/pmd.zip" -d "${RUNNER_TEMP}"
+
+      - name: Measure method complexity
+        shell: python
+        run: |
+          import json
+          import os
+          import re
+          import subprocess
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          temp = Path(os.environ["RUNNER_TEMP"])
+          source = Path(os.environ["SOURCE_PATH"])
+          limit = int(os.environ["COMPLEXITY_LIMIT"])
+          pmd = (
+              temp
+              / f"pmd-bin-{os.environ['PMD_VERSION']}"
+              / "bin/run.sh"
+          )
+
+          if not source.is_dir():
+              raise SystemExit(f"Source directory not found: {source}")
+
+          # Compare the PR head with its merge base.
+          changed = subprocess.check_output([
+              "git", "diff", "--name-only", "-z",
+              "--diff-filter=ACMR",
+              f"{os.environ['BASE_SHA']}...{os.environ['HEAD_SHA']}",
+              "--", source.as_posix(),
+          ]).decode("utf-8").split("\0")
+
+          files = sorted(
+              name for name in changed
+              if name.endswith(".java") and Path(name).is_file()
+          )
+
+          # Report all executable methods; ignore class-level findings below.
+          rules = temp / "complexity-rules.xml"
+          rules.write_text("""<?xml version="1.0" encoding="UTF-8"?>
+          <ruleset name="Method complexity"
+                   xmlns="http://pmd.sourceforge.net/ruleset/2.0.0">
+            <description>Measure method cyclomatic complexity.</description>
+            <rule ref="category/java/design.xml/CyclomaticComplexity">
+              <properties>
+                <property name="methodReportLevel" value="1"/>
+              </properties>
+            </rule>
+          </ruleset>
+          """, encoding="utf-8")
+
+          rows = []
+          failed = False
+          ns = {"p": "http://pmd.sourceforge.net/report/2.0.0"}
+
+          for index, filename in enumerate(files):
+              report = temp / f"pmd-{index}.xml"
+
+              subprocess.run([
+                  "bash", str(pmd), "pmd",
+                  "-d", filename,
+                  "-R", str(rules),
+                  "-f", "xml",
+                  "-r", str(report),
+                  "-language", "java",
+                  "-version", "17",
+                  "-no-cache",
+                  "-failOnViolation", "false",
+              ], check=True)
+
+              root = ET.parse(report).getroot()
+
+              # An analysis error must not be treated as a passing result.
+              errors = (
+                  root.findall(".//p:error", ns)
+                  + root.findall(".//p:configerror", ns)
+              )
+              if errors:
+                  details = [
+                      error.attrib.get("msg")
+                      or "".join(error.itertext()).strip()
+                      for error in errors
+                  ]
+                  raise SystemExit("PMD analysis failed: " + "; ".join(details))
+
+              for violation in root.findall(".//p:violation", ns):
+                  message = " ".join(
+                      "".join(violation.itertext()).split()
+                  )
+
+                  # Exclude class-level totals and constructors.
+                  if not message.startswith("The method "):
+                      continue
+
+                  match = re.search(
+                      r"The method '(.+)' has a cyclomatic complexity of (\d+)",
+                      message,
+                  )
+                  if not match:
+                      raise SystemExit(f"Unexpected PMD message: {message}")
+
+                  method, complexity_text = match.groups()
+                  complexity = int(complexity_text)
+                  exceeded = complexity >= limit
+                  failed = failed or exceeded
+
+                  def escape(value):
+                      return str(value).replace("|", "&#124;").replace(
+                          "<", "&lt;"
+                      ).replace(">", "&gt;")
+
+                  location = f"{filename}:{violation.attrib['beginline']}"
+                  owner = violation.attrib.get("class", "")
+                  label = f"{owner}.{method}" if owner else method
+
+                  rows.append(
+                      f"| {escape(location)} | {escape(label)} "
+                      f"| {complexity} | {'❌' if exceeded else '✅'} |"
+                  )
+
+          heading = (
+              "## 메서드별 순환 복잡도\n\n"
+              f"기준: **{limit} 이상이면 실패**\n\n"
+              "대상: PR에서 변경된 Java 파일의 모든 구현 메서드\n\n"
+          )
+          table = (
+              "| 파일:줄 | 메서드 | 복잡도 | 결과 |\n"
+              "|---|---|---:|:---:|\n"
+          )
+
+          # Split large results into comments without dropping methods.
+          bodies = []
+          body = heading + table
+          for row in rows:
+              if len(body) + len(row) > 50000:
+                  bodies.append(body)
+                  body = heading + table
+              body += row + "\n"
+
+          if not files:
+              body = heading + "변경된 Java 파일이 없습니다.\n"
+          elif not rows:
+              body = heading + "측정할 구현 메서드가 없습니다.\n"
+
+          body += (
+              "\n**결과: 실패 — 복잡도 10 이상인 메서드가 있습니다.**"
+              if failed else "\n**결과: 통과**"
+          )
+          bodies.append(body)
+
+          (temp / "complexity-result.json").write_text(
+              json.dumps({"failed": failed, "comments": bodies},
+                         ensure_ascii=False),
+              encoding="utf-8",
+          )
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"],
+                    "a", encoding="utf-8") as summary:
+              summary.write("\n\n".join(bodies))
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require("fs");
+            const path = require("path");
+            const result = JSON.parse(fs.readFileSync(
+              path.join(process.env.RUNNER_TEMP, "complexity-result.json"),
+              "utf8"
+            ));
+
+            const marker = "<!-- method-complexity-report -->";
+            const params = {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            };
+
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              { ...params, per_page: 100 }
+            );
+            const previous = comments.filter(comment =>
+              comment.user.login === "github-actions[bot]" &&
+              comment.body?.startsWith(marker)
+            ).sort((a, b) => a.id - b.id);
+
+            for (let i = 0; i < result.comments.length; i++) {
+              const body = `${marker}\n${result.comments[i]}`;
+              if (previous[i]) {
+                await github.rest.issues.updateComment({
+                  owner: params.owner,
+                  repo: params.repo,
+                  comment_id: previous[i].id,
+                  body
+                });
+              } else {
+                await github.rest.issues.createComment({ ...params, body });
+              }
+            }
+
+            for (const comment of previous.slice(result.comments.length)) {
+              await github.rest.issues.deleteComment({
+                owner: params.owner,
+                repo: params.repo,
+                comment_id: comment.id
+              });
+            }
+
+      - name: Fail if complexity is 10 or higher
+        if: ${{ always() }}
+        shell: python
+        run: |
+          import json
+          import os
+          from pathlib import Path
+
+          report = Path(os.environ["RUNNER_TEMP"]) / "complexity-result.json"
+          if not report.exists():
+              raise SystemExit("Complexity analysis did not complete.")
+
+          result = json.loads(report.read_text(encoding="utf-8"))
+          if result["failed"]:
+              print("Failed: at least one method has complexity >= 10.")
+              raise SystemExit(1)
+
+          print("Passed: all measured methods have complexity < 10.")
