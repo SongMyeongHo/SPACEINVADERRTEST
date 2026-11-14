@@ -119,6 +119,8 @@ public class GameScreen extends Screen {
 	/** Minimum time between two pause-menu cursor moves. */
 	private static final int PAUSE_SELECTION_DEBOUNCE = 200;
 
+	private final boolean practiceMode;
+
 	/**
 	 * Options listed in the pause menu, in the order they are drawn.
 	 */
@@ -320,9 +322,22 @@ public class GameScreen extends Screen {
 	 * @param fps
 	 *            Frames per second, frame rate at which the game is run.
 	 */
+
+	public GameScreen(
+        final GameState gameState,
+        final GameSettings gameSettings,
+        final boolean bonusLife,
+        final int width,
+        final int height,
+        final int fps) {
+
+    this(gameState, gameSettings, bonusLife,
+            width, height, fps, false);
+	}
+
 	public GameScreen(final GameState gameState,
 					  final GameSettings gameSettings, final boolean bonusLife,
-					  final int width, final int height, final int fps) {
+					  final int width, final int height, final int fps, final boolean practiceMode) {
 		super(width, height, fps);
 
 		this.gameSettings = gameSettings;
@@ -340,6 +355,7 @@ public class GameScreen extends Screen {
 		this.tookDamage = false;
 
 
+		this.practiceMode = practiceMode;
 
 		// Snapshot of how the level started, so "Restart" has something to
 		// come back to.
@@ -417,7 +433,13 @@ public class GameScreen extends Screen {
 		this.pauseStartedAt = 0;
 
 		// Item System (Team CS): level 1 starts a new run, later levels keep it.
-		this.items = ItemSystem.forLevel(this.level);
+		if (this.practiceMode) {
+			// 연습 시작·재시작: 현재 장착 아이템으로 새 상태 생성
+			this.items = ItemSystem.newPracticeRun();
+		} else {
+			// 일반 플레이: 스테이지 사이에서 아이템 상태 유지
+			this.items = ItemSystem.forLevel(this.level);
+		}
 		this.items.beginLevel(this.level, this.width, this.ship,
 				new ItemSystem.GameHooks() {
 					public int getLives() { return lives; }

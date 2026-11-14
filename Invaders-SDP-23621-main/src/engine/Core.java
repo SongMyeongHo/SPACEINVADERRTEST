@@ -20,6 +20,7 @@ import screen.ShopScreen;
 import screen.ShipSelectScreen;
 import screen.TitleScreen;
 import screen.TutorialScreen;
+import screen.ModeSelectScreen;
 
 /**
  * Implements core game logic.
@@ -244,6 +245,34 @@ public final class Core {
 						+ " ship select screen at " + FPS + " fps.");
 				returnCode = frame.setScreen(currentScreen);
 				LOGGER.info("Closing ship select screen.");
+				break;
+			case 8:
+    				currentScreen = new ModeSelectScreen(width, height, FPS);
+    				returnCode = frame.setScreen(currentScreen);
+    			break;
+			case 9:
+				int bossLevel = ModeSelectScreen.bossLevel;
+
+				GameState bossState = new GameState(
+						bossLevel,
+						gameState.getScore(),
+							gameState.getLivesRemaining(),
+							gameState.getBulletsShot(),
+							gameState.getShipsDestroyed(),
+							gameState.getPendingDiamonds(),
+							gameState.getLevelsCompletedRun(),
+                            gameState.getCoinsCollected()
+				);
+
+				currentScreen = new GameScreen(
+						bossState,
+						gameSettings.get(bossLevel - 1),
+						false,
+						width, height, FPS, true
+				);
+
+				frame.setScreen(currentScreen);
+				returnCode = 8;
 				break;
 			default:
 				// No screen for this code yet - back to the menu instead of
