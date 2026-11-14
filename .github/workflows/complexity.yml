@@ -54,6 +54,7 @@ jobs:
           unzip -q "${RUNNER_TEMP}/pmd.zip" -d "${RUNNER_TEMP}"
 
       - name: Measure method complexity
+        id: measure
         shell: python
         run: |
           import json
@@ -66,226 +67,115 @@ jobs:
           temp = Path(os.environ["RUNNER_TEMP"])
           source = Path(os.environ["SOURCE_PATH"])
           limit = int(os.environ["COMPLEXITY_LIMIT"])
-          pmd = (
-              temp
-              / f"pmd-bin-{os.environ['PMD_VERSION']}"
-              / "bin/run.sh"
-          )
-
-          if not source.is_dir():
-              raise SystemExit(f"Source directory not found: {source}")
-
-          # Compare the PR head with its merge base.
-          changed = subprocess.check_output([
-              "git", "diff", "--name-only", "-z",
-              "--diff-filter=ACMR",
-              f"{os.environ['BASE_SHA']}...{os.environ['HEAD_SHA']}",
-              "--", source.as_posix(),
-          ]).decode("utf-8").split("\0")
-
-          files = sorted(
-              name for name in changed
-              if name.endswith(".java") and Path(name).is_file()
-          )
-
-          # Report all executable methods; ignore class-level findings below.
+          pmd = temp / f"pmd-bin-{os.environ['PMD_VERSION']}/bin/run.sh"
           rules = Path(".github/workflows/pmd-ruleset.xml")
+          revision = f"{os.environ['BASE_SHA']}...{os.environ['HEAD_SHA']}"
+          if not source.is_dir() or not rules.is_file():
+              raise SystemExit("Source directory or PMD ruleset not found.")
 
-          if not rules.is_file():
-            raise SystemExit(f"PMD ruleset not found: {rules}")
-
-          rows = []
-          failed = False
+          changed = subprocess.check_output([
+              "git", "diff", "--name-only", "-z", "--diff-filter=ACMR",
+              revision, "--", source.as_posix(),
+          ]).decode("utf-8").split("\0")
+          files = sorted(name for name in changed if name.endswith(".java"))
+          rows, failed = [], False
           ns = {"p": "http://pmd.sourceforge.net/report/2.0.0"}
 
+          def escape(value):
+              return str(value).replace("|", "&#124;").replace("<", "&lt;").replace(">", "&gt;")
+
+          def method_changed(begin, end, ranges):
+              for start, count in ranges:
+                  if count and start <= end and start + count - 1 >= begin:
+                      return True
+                  # A deletion is a gap after start, strictly inside the method.
+                  if count == 0 and begin <= start < end:
+                      return True
+              return False
+
           for index, filename in enumerate(files):
+              diff = subprocess.check_output([
+                  "git", "diff", "--no-ext-diff", "--no-textconv", "--unified=0",
+                  "--no-renames", revision, "--", filename,
+              ]).decode("utf-8", errors="replace")
+              ranges = [(int(start), int(count) if count else 1) for start, count in
+                        re.findall(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", diff, re.M)]
+              if not ranges:
+                  continue
               report = temp / f"pmd-{index}.xml"
-
               subprocess.run([
-                  "bash", str(pmd), "pmd",
-                  "-d", filename,
-                  "-R", str(rules),
-                  "-f", "xml",
-                  "-r", str(report),
-                  "-language", "java",
-                  "-version", "17",
-                  "-no-cache",
-                  "-failOnViolation", "false",
+                  "bash", str(pmd), "pmd", "-d", filename, "-R", str(rules),
+                  "-f", "xml", "-r", str(report), "-language", "java",
+                  "-version", "17", "-no-cache", "-failOnViolation", "false",
               ], check=True)
-
               root = ET.parse(report).getroot()
-
-              # An analysis error must not be treated as a passing result.
-              errors = (
-                  root.findall(".//p:error", ns)
-                  + root.findall(".//p:configerror", ns)
-              )
-              if errors:
-                  details = [
-                      error.attrib.get("msg")
-                      or "".join(error.itertext()).strip()
-                      for error in errors
-                  ]
-                  raise SystemExit("PMD analysis failed: " + "; ".join(details))
+              if root.findall(".//p:error", ns) or root.findall(".//p:configerror", ns):
+                  raise SystemExit(ET.tostring(root, encoding="unicode"))
 
               for violation in root.findall(".//p:violation", ns):
-                  message = " ".join(
-                      "".join(violation.itertext()).split()
-                  )
-
-                  # Exclude class-level totals and constructors.
+                  message = " ".join("".join(violation.itertext()).split())
                   if not message.startswith("The method "):
                       continue
-
-                  match = re.search(
-                      r"The method '(.+)' has a cyclomatic complexity of (\d+)",
-                      message,
-                  )
+                  begin, end = (int(violation.attrib[key]) for key in ("beginline", "endline"))
+                  if not method_changed(begin, end, ranges):
+                      continue
+                  match = re.search(r"The method '(.+)' has a cyclomatic complexity of (\d+)", message)
                   if not match:
                       raise SystemExit(f"Unexpected PMD message: {message}")
-
-                  method, complexity_text = match.groups()
-                  complexity = int(complexity_text)
+                  method, complexity = match.groups()
+                  complexity = int(complexity)
                   exceeded = complexity >= limit
                   failed = failed or exceeded
+                  label = ".".join(filter(None, [violation.get("class"), method]))
+                  rows.append(f"| {escape(filename)}:{begin} | {escape(label)} "
+                              f"| {complexity} | {'❌' if exceeded else '✅'} |")
 
-                  def escape(value):
-                      return str(value).replace("|", "&#124;").replace(
-                          "<", "&lt;"
-                      ).replace(">", "&gt;")
-
-                  location = f"{filename}:{violation.attrib['beginline']}"
-                  owner = violation.attrib.get("class", "")
-                  label = f"{owner}.{method}" if owner else method
-
-                  rows.append(
-                      f"| {escape(location)} | {escape(label)} "
-                      f"| {complexity} | {'❌' if exceeded else '✅'} |"
-                  )
-
-          heading = (
-              "## 메서드별 순환 복잡도\n\n"
-              f"기준: **{limit} 이상이면 실패**\n\n"
-              "대상: PR에서 변경된 Java 파일의 모든 구현 메서드\n\n"
-          )
-          table = (
-              "| 파일:줄 | 메서드 | 복잡도 | 결과 |\n"
-              "|---|---|---:|:---:|\n"
-          )
-
-          # Split large results into comments without dropping methods.
-          bodies = []
-          body = heading + table
+          heading = (f"## 메서드별 순환 복잡도\n\n기준: **{limit} 이상이면 실패**\n\n"
+                     "대상: PR의 변경 줄이 포함된 구현 메서드만 (내부 삭제 포함)\n\n")
+          table = "| 파일:줄 | 메서드 | 복잡도 | 결과 |\n|---|---|---:|:---:|\n"
+          bodies, body = [], heading + table
           for row in rows:
               if len(body) + len(row) > 50000:
                   bodies.append(body)
                   body = heading + table
               body += row + "\n"
-
-          if not files:
-              body = heading + "변경된 Java 파일이 없습니다.\n"
-          elif not rows:
-              body = heading + "측정할 구현 메서드가 없습니다.\n"
-
-          body += (
-              "\n**결과: 실패 — 복잡도 10 이상인 메서드가 있습니다.**"
-              if failed else "\n**결과: 통과**"
-          )
+          if not rows:
+              body = heading + "변경된 구현 메서드가 없습니다.\n"
+          body += "\n**결과: 실패**" if failed else "\n**결과: 통과**"
           bodies.append(body)
-
           (temp / "complexity-result.json").write_text(
-              json.dumps({"failed": failed, "comments": bodies},
-                         ensure_ascii=False),
-              encoding="utf-8",
+              json.dumps({"comments": bodies}, ensure_ascii=False), encoding="utf-8",
           )
-
-          with open(os.environ["GITHUB_STEP_SUMMARY"],
-                    "a", encoding="utf-8") as summary:
-              summary.write("\n\n".join(bodies))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"failed={int(failed)}\n")
 
       - name: Comment on PR
-        if: ${{ !cancelled() }}
         uses: actions/github-script@v7
         with:
           script: |
-            github.hook.error("request", async (error) => {
-              core.error(JSON.stringify({
-                status: error.status,
-                message: error.message,
-                method: error.request?.method,
-                url: error.request?.url,
-                requiredPermissions: error.response?.headers?.["x-accepted-github-permissions"]
-              }));
-              throw error;
-            });
             const fs = require("fs");
             const path = require("path");
             const reportPath = path.join(process.env.RUNNER_TEMP, "complexity-result.json");
-            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
-            const result = fs.existsSync(reportPath)
-              ? JSON.parse(fs.readFileSync(reportPath, "utf8"))
-              : {
-                  failed: true,
-                  comments: [
-                    "## PMD analysis failed\n\n" +
-                    "Analysis did not complete, so method complexity is unavailable.\n\n" +
-                    `[View the failed workflow steps](${runUrl})`
-                  ]
-                };
-
+            const result = JSON.parse(fs.readFileSync(reportPath, "utf8"));
             const marker = "<!-- method-complexity-report -->";
-            const params = {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number
-            };
-
-            const comments = await github.paginate(
-              github.rest.issues.listComments,
-              { ...params, per_page: 100 }
-            );
-            const previous = comments.filter(comment =>
-              comment.user.login === "github-actions[bot]" &&
-              comment.body?.startsWith(marker)
+            const repo = context.repo;
+            const params = { ...repo, issue_number: context.issue.number };
+            const comments = await github.paginate(github.rest.issues.listComments, params);
+            const previous = comments.filter(c =>
+              c.user.login === "github-actions[bot]" && c.body?.startsWith(marker)
             ).sort((a, b) => a.id - b.id);
-
-            for (let i = 0; i < result.comments.length; i++) {
-              const body = `${marker}\n${result.comments[i]}`;
+            for (const [i, text] of result.comments.entries()) {
+              const body = `${marker}\n${text}`;
               if (previous[i]) {
-                await github.rest.issues.updateComment({
-                  owner: params.owner,
-                  repo: params.repo,
-                  comment_id: previous[i].id,
-                  body
-                });
+                await github.rest.issues.updateComment({ ...repo, comment_id: previous[i].id, body });
               } else {
                 await github.rest.issues.createComment({ ...params, body });
               }
             }
-
             for (const comment of previous.slice(result.comments.length)) {
-              await github.rest.issues.deleteComment({
-                owner: params.owner,
-                repo: params.repo,
-                comment_id: comment.id
-              });
+              await github.rest.issues.deleteComment({ ...repo, comment_id: comment.id });
             }
 
       - name: Fail if complexity is 10 or higher
-        if: ${{ always() }}
-        shell: python
-        run: |
-          import json
-          import os
-          from pathlib import Path
-
-          report = Path(os.environ["RUNNER_TEMP"]) / "complexity-result.json"
-          if not report.exists():
-              raise SystemExit("Complexity analysis did not complete.")
-
-          result = json.loads(report.read_text(encoding="utf-8"))
-          if result["failed"]:
-              print("Failed: at least one method has complexity >= 10.")
-              raise SystemExit(1)
-
-          print("Passed: all measured methods have complexity < 10.")
+        if: ${{ !cancelled() && steps.measure.outputs.failed == '1' }}
+        run: exit 1
