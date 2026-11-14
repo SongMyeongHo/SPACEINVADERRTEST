@@ -130,9 +130,9 @@ jobs:
                   rows.append(f"| {escape(filename)}:{begin} | {escape(label)} "
                               f"| {complexity} | {'❌' if exceeded else '✅'} |")
 
-          heading = (f"## 메서드별 순환 복잡도\n\n기준: **{limit} 이상이면 실패**\n\n"
-                     "대상: PR의 변경 줄이 포함된 구현 메서드만 (내부 삭제 포함)\n\n")
-          table = "| 파일:줄 | 메서드 | 복잡도 | 결과 |\n|---|---|---:|:---:|\n"
+          heading = (f"## Cyclomatic Complexity by Method\n\nThreshold: **Fail if complexity is {limit} or higher**\n\n"
+                     "Scope: Only implemented methods containing changed lines in the PR (including internal deletions)\n\n")
+          table = "| File:Line | Method | Complexity | Result |\n|---|---|---:|:---:|\n"
           bodies, body = [], heading + table
           for row in rows:
               if len(body) + len(row) > 50000:
@@ -140,8 +140,8 @@ jobs:
                   body = heading + table
               body += row + "\n"
           if not rows:
-              body = heading + "변경된 구현 메서드가 없습니다.\n"
-          body += "\n**결과: 실패**" if failed else "\n**결과: 통과**"
+              body = heading + "No changed implemented methods found.\n"
+          body += "\n**Result: Failed**" if failed else "\n**Result: Passed**"
           bodies.append(body)
           (temp / "complexity-result.json").write_text(
               json.dumps({"comments": bodies}, ensure_ascii=False), encoding="utf-8",
