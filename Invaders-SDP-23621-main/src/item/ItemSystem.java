@@ -91,6 +91,10 @@ public final class ItemSystem {
         return current;
     }
 
+    public static ItemSystem newPracticeRun() {
+    return new ItemSystem(new Random());
+    }
+
     /** The current run. May be null outside a run (menus, etc.). */
     public static ItemSystem current() { return current; }
 
