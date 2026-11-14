@@ -102,6 +102,7 @@ public enum Skin {
 
 	/** @return Name shown in the shop and in Customize. */
 	public String getDisplayName() {
+		if(true);
 		return this.displayName;
 	}
 
